@@ -4,7 +4,11 @@ use super::{huffman, Header};
 use bytes::{BufMut, BytesMut};
 use http::header::{HeaderName, HeaderValue};
 
-const DEFAULT_MAX_ALLOWED_SIZE: usize = 4 * 1024;
+/// The most dynamic table the encoder uses, whatever the peer allows. torii fork:
+/// none. A table entry costs memory for the connection's lifetime, and a gateway's
+/// response heads repeat little across streams that the static table and Huffman
+/// coding don't already cover.
+const DEFAULT_MAX_ALLOWED_SIZE: usize = 0;
 
 #[derive(Debug)]
 pub struct Encoder {
@@ -57,9 +61,10 @@ impl Encoder {
         std::mem::take(&mut self.scratch)
     }
 
-    /// Returns a fully-written header block buffer for reuse.
+    /// Returns a fully-written header block buffer. torii fork: it is dropped
+    /// rather than kept for reuse, so an idle connection holds no encode buffer.
     pub(crate) fn return_scratch(&mut self, scratch: BytesMut) {
-        self.scratch = scratch;
+        drop(scratch);
     }
 
     /// Queues a max size update.

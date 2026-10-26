@@ -61,6 +61,28 @@ impl Header<Option<HeaderName>> {
 }
 
 impl Header {
+    /// A copy of the header whose strings have their own allocations, rather than
+    /// sharing the buffer they were decoded from (torii fork).
+    pub fn to_owned_copy(&self) -> Header {
+        use self::Header::*;
+
+        match self {
+            Field { name, value } => {
+                let mut copy = HeaderValue::from_bytes(value.as_bytes())
+                    .expect("a header value stays valid when copied");
+                copy.set_sensitive(value.is_sensitive());
+                Field {
+                    name: name.clone(),
+                    value: copy,
+                }
+            }
+            Authority(v) => Authority(BytesStr::from(v.as_str())),
+            Scheme(v) => Scheme(BytesStr::from(v.as_str())),
+            Path(v) => Path(BytesStr::from(v.as_str())),
+            other => other.clone(),
+        }
+    }
+
     pub fn new(name: Bytes, value: Bytes) -> Result<Header, DecoderError> {
         if name.is_empty() {
             return Err(DecoderError::NeedMore(NeedMore::UnexpectedEndOfStream));

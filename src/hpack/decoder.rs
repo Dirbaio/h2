@@ -158,7 +158,9 @@ impl Decoder {
             max_size_update: None,
             last_max_update: size,
             table: Table::new(size),
-            buffer: BytesMut::with_capacity(4096),
+            // Allocated by the first Huffman-coded string, and let go after each
+            // header block (torii fork).
+            buffer: BytesMut::new(),
         }
     }
 
@@ -175,6 +177,21 @@ impl Decoder {
 
     /// Decodes the headers found in the given buffer.
     pub fn decode<F>(
+        &mut self,
+        src: &mut Cursor<&mut BytesMut>,
+        f: F,
+    ) -> Result<(), DecoderError>
+    where
+        F: FnMut(Header) -> ControlFlow<()>,
+    {
+        let res = self.decode_block(src, f);
+        // The decoded strings own (a share of) the scratch buffer's allocation;
+        // don't keep its spare capacity on an idle connection (torii fork).
+        self.buffer = BytesMut::new();
+        res
+    }
+
+    fn decode_block<F>(
         &mut self,
         src: &mut Cursor<&mut BytesMut>,
         mut f: F,
@@ -214,8 +231,11 @@ impl Decoder {
                     can_resize = false;
                     let entry = self.decode_literal(src, true)?;
 
-                    // Insert the header into the table
-                    self.table.insert(entry.clone());
+                    // Insert the header into the table. The entry gets its own
+                    // allocations: `entry` points into the frame's receive buffer,
+                    // which the table would otherwise keep alive for as long as the
+                    // entry stays in it (torii fork).
+                    self.table.insert(entry.to_owned_copy());
                     consume(src);
 
                     if f(entry).is_break() {
