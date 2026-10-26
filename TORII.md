@@ -1,7 +1,7 @@
 # torii's fork of h2 0.4.20
 
 This is the `torii` branch: h2 0.4.20 (https://github.com/hyperium/h2) plus the
-changes below, for [torii](https://github.com/Dirbaio/lolgateway)'s data plane. Every change is marked
+changes below, for [torii](https://github.com/Dirbaio/torii)'s data plane. Every change is marked
 `torii fork` in the source. The goal: an idle HTTP/2 connection holds no I/O
 buffers, as in nginx.
 
