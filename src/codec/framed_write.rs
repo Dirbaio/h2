@@ -93,7 +93,9 @@ where
             final_flush_done: false,
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
-                buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
+                // Allocated when a frame is buffered, and let go once all of it is
+                // written (torii fork).
+                buf: Cursor::new(BytesMut::new()),
                 next: None,
                 last_data_frame: None,
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
@@ -169,6 +171,10 @@ where
             }
         }
 
+        // Everything buffered is written: don't hold the buffer while the
+        // connection is idle (torii fork).
+        self.encoder.buf = Cursor::new(BytesMut::new());
+
         tracing::trace!("flushing buffer");
         // Flush the upstream
         ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
@@ -223,6 +229,9 @@ where
     fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
         // Ensure that we have enough capacity to accept the write.
         assert!(self.has_capacity());
+        if self.buf.get_ref().capacity() == 0 {
+            self.buf.get_mut().reserve(DEFAULT_BUFFER_CAPACITY);
+        }
         let span = tracing::trace_span!("FramedWrite::buffer", frame = ?item);
         let _e = span.enter();
 
@@ -307,9 +316,11 @@ where
     }
 
     fn has_capacity(&self) -> bool {
+        // A buffer not allocated yet gets DEFAULT_BUFFER_CAPACITY in `buffer`.
         self.next.is_none()
-            && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
-                >= self.min_buffer_capacity)
+            && (self.buf.get_ref().capacity() == 0
+                || self.buf.get_ref().capacity() - self.buf.get_ref().len()
+                    >= self.min_buffer_capacity)
     }
 
     fn is_empty(&self) -> bool {

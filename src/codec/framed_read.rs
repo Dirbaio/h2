@@ -14,18 +14,115 @@ use std::io;
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::AsyncRead;
-use tokio_util::codec::FramedRead as InnerFramedRead;
-use tokio_util::codec::{LengthDelimitedCodec, LengthDelimitedCodecError};
+use tokio::io::{AsyncRead, ReadBuf};
 
 // 16 MB "sane default" taken from golang http2
 const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
 
 #[derive(Debug)]
 pub struct FramedRead<T> {
-    inner: InnerFramedRead<T, LengthDelimitedCodec>,
+    inner: FrameReader<T>,
 
     decoder: FrameDecoder,
+}
+
+/// How much to read at a time when no frame needs more.
+const READ_SIZE: usize = 8 * 1024;
+
+/// Splits the byte stream into frames (head included), reading into a buffer that
+/// exists only while it holds bytes: when a read would block with nothing buffered,
+/// the buffer is let go, so an idle connection holds none (torii fork; replaces
+/// tokio-util's `FramedRead` + `LengthDelimitedCodec`, whose 8 KiB buffer lived as
+/// long as the connection).
+#[derive(Debug)]
+pub(crate) struct FrameReader<T> {
+    io: T,
+    buf: BytesMut,
+    max_frame_length: usize,
+    eof: bool,
+}
+
+/// Why [`FrameReader`] could not produce a frame.
+#[derive(Debug)]
+enum ReadError {
+    Io(io::Error),
+    /// A frame's length is over the max frame size.
+    TooLong,
+}
+
+impl<T> FrameReader<T> {
+    pub(crate) fn new(io: T, max_frame_length: usize) -> Self {
+        FrameReader {
+            io,
+            buf: BytesMut::new(),
+            max_frame_length,
+            eof: false,
+        }
+    }
+
+    pub(crate) fn get_ref(&self) -> &T {
+        &self.io
+    }
+
+    pub(crate) fn get_mut(&mut self) -> &mut T {
+        &mut self.io
+    }
+
+    fn max_frame_length(&self) -> usize {
+        self.max_frame_length
+    }
+
+    fn set_max_frame_length(&mut self, val: usize) {
+        self.max_frame_length = val;
+    }
+}
+
+impl<T: AsyncRead + Unpin> FrameReader<T> {
+    fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<BytesMut, ReadError>>> {
+        loop {
+            // The bytes the next frame still needs, or None if it is all here.
+            let need = if self.buf.len() < frame::HEADER_LEN {
+                frame::HEADER_LEN - self.buf.len()
+            } else {
+                let len = ((self.buf[0] as usize) << 16) | ((self.buf[1] as usize) << 8) | self.buf[2] as usize;
+                if len > self.max_frame_length {
+                    return Poll::Ready(Some(Err(ReadError::TooLong)));
+                }
+                let total = frame::HEADER_LEN + len;
+                if self.buf.len() >= total {
+                    return Poll::Ready(Some(Ok(self.buf.split_to(total))));
+                }
+                total - self.buf.len()
+            };
+            if self.eof {
+                return Poll::Ready(if self.buf.is_empty() {
+                    None
+                } else {
+                    Some(Err(ReadError::Io(io::Error::other("bytes remaining on stream"))))
+                });
+            }
+            self.buf.reserve(need.max(READ_SIZE));
+            let n = {
+                let dst = self.buf.spare_capacity_mut();
+                let mut read = ReadBuf::uninit(dst);
+                match Pin::new(&mut self.io).poll_read(cx, &mut read) {
+                    Poll::Ready(Ok(())) => read.filled().len(),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(ReadError::Io(e)))),
+                    Poll::Pending => {
+                        if self.buf.is_empty() {
+                            self.buf = BytesMut::new();
+                        }
+                        return Poll::Pending;
+                    }
+                }
+            };
+            // SAFETY: `poll_read` initialized the first `n` bytes of the spare capacity.
+            unsafe { self.buf.set_len(self.buf.len() + n) };
+            if n == 0 {
+                self.eof = true;
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -59,8 +156,8 @@ enum Continuable {
 }
 
 impl<T> FramedRead<T> {
-    pub fn new(inner: InnerFramedRead<T, LengthDelimitedCodec>) -> FramedRead<T> {
-        let decoder = FrameDecoder::new(inner.decoder().max_frame_length());
+    pub(crate) fn new(inner: FrameReader<T>) -> FramedRead<T> {
+        let decoder = FrameDecoder::new(inner.max_frame_length());
         FramedRead { inner, decoder }
     }
 
@@ -75,7 +172,7 @@ impl<T> FramedRead<T> {
     /// Returns the current max frame size setting
     #[inline]
     pub fn max_frame_size(&self) -> usize {
-        self.inner.decoder().max_frame_length()
+        self.inner.max_frame_length()
     }
 
     /// Updates the max frame size setting.
@@ -84,7 +181,7 @@ impl<T> FramedRead<T> {
     #[inline]
     pub fn set_max_frame_size(&mut self, val: usize) {
         assert!(DEFAULT_MAX_FRAME_SIZE as usize <= val && val <= MAX_MAX_FRAME_SIZE as usize);
-        self.inner.decoder_mut().set_max_frame_length(val);
+        self.inner.set_max_frame_length(val);
         // Update max CONTINUATION frames too, since its based on this
         self.decoder.set_max_frame_size(val);
     }
@@ -421,9 +518,12 @@ where
         let _e = span.enter();
         loop {
             tracing::trace!("poll");
-            let bytes = match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
+            let bytes = match ready!(self.inner.poll_frame(cx)) {
                 Some(Ok(bytes)) => bytes,
-                Some(Err(e)) => return Poll::Ready(Some(Err(map_err(e)))),
+                Some(Err(ReadError::TooLong)) => {
+                    return Poll::Ready(Some(Err(Error::library_go_away(Reason::FRAME_SIZE_ERROR))))
+                }
+                Some(Err(ReadError::Io(e))) => return Poll::Ready(Some(Err(e.into()))),
                 None => return Poll::Ready(None),
             };
 
@@ -434,17 +534,6 @@ where
             }
         }
     }
-}
-
-fn map_err(err: io::Error) -> Error {
-    if let io::ErrorKind::InvalidData = err.kind() {
-        if let Some(custom) = err.get_ref() {
-            if custom.is::<LengthDelimitedCodecError>() {
-                return Error::library_go_away(Reason::FRAME_SIZE_ERROR);
-            }
-        }
-    }
-    err.into()
 }
 
 // ===== impl Continuable =====
