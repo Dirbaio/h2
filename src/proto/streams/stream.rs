@@ -272,11 +272,19 @@ impl Stream {
     }
 
     /// Current available stream send capacity
+    ///
+    /// torii fork: none while data handed to the stream is still unsent, so a
+    /// stream has one batch in flight (nginx's `stream->queued`). Otherwise a
+    /// stream fed tiny chunks while its client does not read queues one frame per
+    /// chunk, thousands of them within `max_buffer_size`. The capacity grows back
+    /// (and the sender is notified) once the batch is written.
     pub fn capacity(&self, max_buffer_size: usize) -> WindowSize {
+        if self.buffered_send_data > 0 {
+            return 0;
+        }
         let available = self.send_flow.available().as_size() as usize;
-        let buffered = self.buffered_send_data;
 
-        available.min(max_buffer_size).saturating_sub(buffered) as WindowSize
+        available.min(max_buffer_size) as WindowSize
     }
 
     pub fn assign_capacity(&mut self, capacity: WindowSize, max_buffer_size: usize) {
