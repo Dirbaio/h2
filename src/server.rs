@@ -1749,8 +1749,11 @@ impl proto::Peer for Peer {
             parts.path_and_query = Some(maybe_path.or_else(|why| {
                 malformed!("malformed headers: malformed path ({:?}): {}", path, why,)
             })?);
-        } else if is_connect && has_protocol {
-            malformed!("malformed headers: missing path in extended CONNECT");
+        } else if !is_connect || has_protocol {
+            // torii fork: every request but a plain CONNECT needs a :path (RFC 9113
+            // §8.3.1); upstream checked only extended CONNECT, and an empty URI
+            // then read as `/` (T115).
+            malformed!("malformed headers: missing path");
         }
 
         b = b.uri(parts);
