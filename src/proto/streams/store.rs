@@ -406,6 +406,11 @@ impl<'a> Ptr<'a> {
         // Remove the stream state
         let stream = self.store.slab.remove(self.key.index.0 as usize);
         assert_eq!(stream.id, self.key.stream_id);
+        // Give back the slab's memory once the last stream is gone, so an idle
+        // connection doesn't keep the high-water mark of its streams (torii fork).
+        if self.store.slab.is_empty() {
+            self.store.slab = slab::Slab::new();
+        }
         stream.id
     }
 
@@ -416,6 +421,10 @@ impl<'a> Ptr<'a> {
     pub fn unlink(&mut self) {
         let id = self.key.stream_id;
         self.store.ids.swap_remove(&id);
+        // As in `remove` (torii fork).
+        if self.store.ids.is_empty() {
+            self.store.ids = IndexMap::new();
+        }
     }
 }
 

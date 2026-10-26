@@ -82,6 +82,10 @@ impl Deque {
         match self.indices {
             Some(mut idxs) => {
                 let mut slot = buf.slab.remove(idxs.head);
+                // Give back the slab's memory once no frame is buffered (torii fork).
+                if buf.slab.is_empty() {
+                    buf.slab = Slab::new();
+                }
 
                 if idxs.head == idxs.tail {
                     assert!(slot.next.is_none());
